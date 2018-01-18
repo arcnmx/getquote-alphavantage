@@ -1,0 +1,263 @@
+#!/bin/bash
+set -eu
+set -o pipefail
+
+main() {
+	local APIKEY=${ALPHAVANTAGE_API_KEY-}
+	local PERIOD=${GETQUOTE_PERIOD-today}
+	local TARGET_CURRENCY=${GETQUOTE_CURRENCY-CAD}
+
+	while getopts ":hk:p:c:" opt; do
+		case $opt in
+			k)
+				APIKEY=$OPTARG
+				exit 1
+				;;
+			p)
+				PERIOD=$OPTARG
+				;;
+			c)
+				TARGET_CURRENCY=$OPTARG
+				;;
+			h)
+				usage
+				exit
+				;;
+			\?)
+				echo "Invalid option -$OPTARG" >&2
+				usage >&2
+				exit 1
+				;;
+			:)
+				echo "Option -$OPTARG requires an argument" >&2
+				usage >&2
+				exit 1
+				;;
+		esac
+	done
+
+	shift $((OPTIND-1))
+
+	if [[ $# -lt 1 ]]; then
+		usage >&2
+		exit 1
+	fi
+
+	local SYMBOL=$1
+	shift
+
+	if [[ $# -gt 0 ]]; then
+		TARGET_CURRENCY=$1
+		shift
+	fi
+
+	if is_currency "$SYMBOL"; then
+		if [[ $SYMBOL = $TARGET_CURRENCY ]]; then
+			if false; then
+				format_response "$(date_format)" "$SYMBOL" 1.00 "$SYMBOL"
+			else
+				echo "Cannot forex between same currency" >&2
+				exit 1
+			fi
+		else
+			forex "$APIKEY" "$SYMBOL" "$TARGET_CURRENCY"
+		fi
+	else
+		if [[ $TARGET_CURRENCY != $(currency_for_market "$(symbol_market "$SYMBOL")") ]] && false; then
+			local DATA EXCHANGE
+			DATA=$(query_value "$APIKEY" "$PERIOD" "4. close" "$SYMBOL")
+			EXCHANGE=$(forex "$APIKEY" "$(currency_for_market "$(symbol_market "$SYMBOL")")" "$TARGET_CURRENCY" | cut -d ' ' -f 4)
+			DATA=($DATA)
+			if [[ ${#DATA[@]} -eq 5 ]]; then
+				DATA[3]=$(echo "${DATA[3]} * $EXCHANGE" | bc)
+				DATA[4]=$TARGET_CURRENCY
+			elif [[ ${#DATA[@]} -eq 4 ]]; then
+				DATA[2]=$(echo "${DATA[2]} * $EXCHANGE" | bc)
+				DATA[3]=$TARGET_CURRENCY
+			else
+				echo "unexpected data" >&2
+				exit 1
+			fi
+			echo "${DATA[*]}"
+		else
+			query_value "$APIKEY" "$PERIOD" "4. close" "$SYMBOL"
+		fi
+	fi
+}
+
+is_currency() {
+	local SYMBOL
+	SYMBOL=$1
+
+	case $SYMBOL in
+		CAD | USD | GBP | JPY)
+			return 0
+			;;
+		*)
+			return 1
+			;;
+	esac
+}
+
+date_format() {
+	local DATE_FORMAT="+%Y/%m/%d %H:%M:%S"
+	if [[ $# -lt 1 ]]; then
+		date "$DATE_FORMAT"
+	else
+		date -d "$1" "$DATE_FORMAT"
+	fi
+}
+
+url_for_period() {
+	local APIKEY PERIOD SYMBOL
+	APIKEY=$1
+	PERIOD=$2
+	SYMBOL=$3
+
+	case $PERIOD in
+		now)
+			echo "https://www.alphavantage.co/query?function=TIME_SERIES_INTRADAY&interval=1min&symbol=$SYMBOL&apikey=$APIKEY"
+			;;
+		*)
+			echo "https://www.alphavantage.co/query?function=TIME_SERIES_DAILY&symbol=$SYMBOL&apikey=$APIKEY"
+			;;
+	esac
+}
+
+forex() {
+	local APIKEY CURRENCY_FROM CURRENCY_TO DATA AMOUNT DATE
+	APIKEY=$1
+	CURRENCY_FROM=$2
+	CURRENCY_TO=$3
+
+	DATA=$(curl -sSfL "https://www.alphavantage.co/query?function=CURRENCY_EXCHANGE_RATE&from_currency=$CURRENCY_FROM&to_currency=$CURRENCY_TO&apikey=$APIKEY" | check_error)
+
+	AMOUNT=$(echo "$DATA" | jq -re '."Realtime Currency Exchange Rate"."5. Exchange Rate"')
+	DATE=$(echo "$DATA" | jq -re '."Realtime Currency Exchange Rate"."6. Last Refreshed"')
+
+	format_response "$(date_format "$DATE")" "$CURRENCY_FROM" "$AMOUNT" "$CURRENCY_TO"
+}
+
+check_error() {
+	local DATA
+	DATA=$(cat)
+
+	if echo "$DATA" | jq -e '."Error Message"' > /dev/null; then
+		echo "$DATA" | jq -re '."Error Message"' >&2
+		exit 1
+	fi
+
+	echo "$DATA"
+}
+
+format_response() {
+	local DATE SYMBOL ARMOUNT CURRENCY
+	DATE=$1
+	SYMBOL=$2
+	AMOUNT=$3
+	CURRENCY=$4
+
+	if [[ $AMOUNT = null ]]; then
+		echo "null amount" >&2
+		exit 1
+	fi
+
+	if [[ $DATE = *00:00:00 ]]; then
+		DATE=$(echo "$DATE" | cut -d ' ' -f 1)
+	fi
+
+	echo "$DATE $SYMBOL $AMOUNT $CURRENCY"
+}
+
+query_for_period() {
+	local PERIOD KEY SYMBOL CURRENCY DATA DATE DATE_SELECTOR SELECTOR AMOUNT
+	PERIOD=$1
+	KEY=$2
+
+	SYMBOL=$3
+	CURRENCY=$4
+
+	DATA=$(cat)
+
+	DATE=$(echo "$DATA" | jq -re '."Meta Data"."3. Last Refreshed"')
+	DATE_SELECTOR=$DATE
+	case $PERIOD in
+		now)
+			SELECTOR=1min
+			;;
+		today)
+			SELECTOR=Daily
+			DATE_SELECTOR=$(echo "$DATE" | cut -d ' ' -f 1)
+			;;
+		*)
+			SELECTOR=Daily
+			DATE_SELECTOR=$PERIOD
+			DATE=$PERIOD
+			;;
+	esac
+
+	AMOUNT=$(echo "$DATA" | jq -re ".\"Time Series ($SELECTOR)\".\"$DATE_SELECTOR\".\"$KEY\"") || exit 1
+
+	format_response "$(date_format "$DATE")" "$SYMBOL" "$AMOUNT" "$CURRENCY"
+}
+
+symbol_market() {
+	local SYMBOL
+	SYMBOL=$1
+
+	if ! [[ $SYMBOL = *:* ]]; then
+		echo "Market not specified for symbol $SYMBOL" >&2
+		exit 1
+	fi
+
+	echo "$SYMBOL" | cut -d: -f1
+}
+
+currency_for_market() {
+	local MARKET
+	MARKET=$1
+
+	case $MARKET in
+		TSX | TSXV)
+			echo "CAD"
+			;;
+		NASDAQ)
+			echo "USD"
+			;;
+		*)
+			echo "Unrecognized market: $MARKET" >&2
+			exit 1
+			;;
+	esac
+}
+
+query_value() {
+	local APIKEY PERIOD KEY SYMBOL CURRENCY URL
+	APIKEY=$1
+	PERIOD=$2
+	KEY=$3
+	SYMBOL=$4
+
+	CURRENCY=$(currency_for_market "$(symbol_market "$SYMBOL")")
+
+	URL=$(url_for_period "$APIKEY" "$PERIOD" "$SYMBOL")
+	curl -sSfL "$URL" | check_error | query_for_period "$PERIOD" "$KEY" "$SYMBOL" "$CURRENCY"
+}
+
+usage() {
+	echo "$0 [options] SYMBOL"
+	echo "  -h: show help"
+	echo "  -k KEY: alphavantage API key"
+	echo "  -c CURRENCY: forex target currency"
+	echo "  -p PERIOD: period to query"
+	echo "             - now: intraday"
+	echo "             - today: last close"
+	echo "             - yyyy/mm/dd: specific date"
+	echo
+	echo "Environment Variables"
+	echo "  ALPHAVANTAGE_API_KEY: alphavantage API key"
+	echo "  GETQUOTE_PERIOD: period"
+	echo "  GETQUOTE_CURRENCY: target currency"
+}
+
+main "$@"
