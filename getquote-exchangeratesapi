@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+
+BASEURL="https://api.exchangeratesapi.io/latest"
+
+forex() {
+	local CURRENCY_FROM CURRENCY_TO DATA
+	CURRENCY_FROM=$1
+	CURRENCY_TO=$2
+
+	DATA=$(curl -sSfL "$BASEURL?base=$CURRENCY_TO&symbols=$CURRENCY_FROM")
+	jq -r ".rates.$SYMBOL" <<< "$DATA"
+}
+
+main() {
+	local PERIOD=${GETQUOTE_PERIOD-today}
+	local TARGET_CURRENCY=${GETQUOTE_CURRENCY-CAD}
+
+	local SYMBOL="$1"
+	shift
+
+	forex "$SYMBOL" "$TARGET_CURRENCY"
+}
+
+main "$@"
